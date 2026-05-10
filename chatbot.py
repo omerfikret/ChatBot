@@ -1,239 +1,219 @@
 """
-============================================================
-  Makine Öğrenmesi Tabanlı Türkçe ChatBot  v2.0
-  ─────────────────────────────────────────────
-  Pandas │ TF-IDF │ NumPy │ Cosine Similarity
-  + Anahtar Kelime Tabanlı Cümle Üretimi (Bigram Markov)
-============================================================
+ML Tabanlı Türkçe ChatBot  v3.0
+Pandas(chunksize) | TF-IDF(word+char hstack) | NumPy | Bigram
 """
 
+import sys, re, random, time
 import pandas as pd
 import numpy as np
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
+from scipy.sparse import hstack
 from collections import defaultdict
-import re, sys, random
 
+# ─────────────────────────────────────────
+# YARDIMCI
+# ─────────────────────────────────────────
+def _norm(t: str) -> str:
+    t = str(t).lower().strip()
+    t = re.sub(r"[^\w\s]", " ", t)
+    return re.sub(r"\s+", " ", t).strip()
 
-# ══════════════════════════════════════════════════════════
-#  BÖLÜM 1 ─ VERİ YÜKLEME VE TEMİZLEME  (Pandas)
-# ══════════════════════════════════════════════════════════
+# ─────────────────────────────────────────
+# BÖLÜM 1 — CHUNK BAZLI OKUMA
+# ─────────────────────────────────────────
+# pd.read_csv() normalde tüm dosyayı tek seferde RAM'e yükler.
+# chunksize=N ise dosyayı N satırlık dilimler halinde okuyup
+# iterator döndürür; her dilim ayrı işlenir. Böylece bellek
+# kullanımı O(toplam) yerine O(chunk) sabit kalır.
+CHUNK_N = 256
 
-def veri_yukle(csv_yolu: str) -> pd.DataFrame:
+def veri_yukle(yol: str) -> pd.DataFrame:
     try:
-        df = pd.read_csv(csv_yolu, encoding="utf-8")
+        reader = pd.read_csv(yol, encoding="utf-8",
+                             chunksize=CHUNK_N, on_bad_lines="skip")
     except FileNotFoundError:
-        sys.exit(f"[HATA] '{csv_yolu}' bulunamadı.")
-    except Exception as e:
-        sys.exit(f"[HATA] CSV okunamadı: {e}")
+        sys.exit(f"[HATA] '{yol}' bulunamadı.")
 
-    df.columns = df.columns.str.strip().str.lower()
+    gorduk  = set()   # O(1) duplicate lookup
+    parclar = []
 
-    if "girdi" not in df.columns or "cevap" not in df.columns:
-        sys.exit("[HATA] CSV'de 'girdi' ve 'cevap' sütunları olmalı.")
+    for chunk in reader:
+        chunk.columns = chunk.columns.str.strip().str.lower()
+        if "girdi" not in chunk.columns or "cevap" not in chunk.columns:
+            continue
 
-    # Pandas vektörel temizlik — tek geçiş, RAM dostu
-    df = df.dropna(subset=["girdi", "cevap"]).copy()
-    df["girdi"]      = df["girdi"].str.strip()
-    df["cevap"]      = df["cevap"].str.strip()
-    df["girdi_norm"] = df["girdi"].apply(_normalize)
-    df = (df.drop_duplicates(subset="girdi_norm", keep="first")
-            .reset_index(drop=True))
+        chunk = (chunk
+                 .dropna(subset=["girdi","cevap"])
+                 .assign(girdi=chunk["girdi"].str.strip(),
+                         cevap=chunk["cevap"].str.strip()))
+        chunk["gn"] = chunk["girdi"].apply(_norm)
 
-    print(f"[BİLGİ] {len(df)} eğitim cümlesi yüklendi.")
+        # chunk içinde hızlı filtre
+        chunk = chunk[chunk["gn"].str.len() >= 2]
+        chunk = chunk[chunk["cevap"].str.len() >= 10]
+        chunk = chunk[~chunk["gn"].isin(gorduk)]
+        gorduk.update(chunk["gn"].tolist())
+        parclar.append(chunk[["girdi","cevap","gn"]])
+
+    if not parclar:
+        sys.exit("[HATA] CSV boş veya sütun yapısı hatalı.")
+
+    df = pd.concat(parclar, ignore_index=True)
+    df.drop_duplicates("gn", keep="first", inplace=True)
+    df.reset_index(drop=True, inplace=True)
     return df
 
-
-def _normalize(metin: str) -> str:
-    metin = str(metin).lower().strip()
-    metin = re.sub(r"[^\w\s]", " ", metin)
-    metin = re.sub(r"\s+", " ", metin)
-    return metin
-
-
-# ══════════════════════════════════════════════════════════
-#  BÖLÜM 2 ─ TF-IDF VEKTÖRLEŞTİRME  (Scikit-learn)
-# ══════════════════════════════════════════════════════════
+# ─────────────────────────────────────────
+# BÖLÜM 2 — VEKTÖRLEŞTİRME  (word + char)
+# ─────────────────────────────────────────
+# Neden iki vektörizer birden?
+#
+#  SORUN — sadece char_wb(1,3) kullanınca:
+#   "yapay zeka nedir" ←→ "Yapay zeka nedir?" → cosine ≈ 1.00
+#   Çünkü karakter n-gramları büyük/küçük harf ve noktalama farkını
+#   görmezden gelir; "nasıl kullanılıyor" ile "nasıl kullanılır"
+#   neredeyse aynı karakter dizisi → yanlış eşleşme.
+#
+#  ÇÖZÜM — word(1,2) + char_wb(2,3) scipy.sparse.hstack ile birleştir:
+#   • word n-gram → kelime düzeyinde ANLAM farkını yakalar
+#     ("kullanılıyor" ≠ "kullanılır" → farklı token)
+#   • char n-gram → yazım hatası toleransı sağlar
+#   • hstack → iki seyrek matris RAM'de birleşir, yoğunlaştırmaz
+#   • max_features tavanı → matris boyutu kontrol altında
 
 def vektorlestir(df: pd.DataFrame):
-    vec = TfidfVectorizer(
-        analyzer="char_wb",   # karakter n-gram, yazım hatalarına dayanıklı
-        ngram_range=(1, 3),
-        min_df=1,
-        sublinear_tf=True,    # log(tf) → sık karakterleri bastır
-        max_features=5000,    # bellek tavanı
-    )
-    matris = vec.fit_transform(df["girdi_norm"])
-    print(f"[BİLGİ] TF-IDF matrisi: {matris.shape[0]} x {matris.shape[1]}")
-    return vec, matris
+    vw = TfidfVectorizer(analyzer="word",    ngram_range=(1,2),
+                         sublinear_tf=True,  max_features=2500)
+    vc = TfidfVectorizer(analyzer="char_wb", ngram_range=(2,3),
+                         sublinear_tf=True,  max_features=2500)
+    Mw = vw.fit_transform(df["gn"])   # seyrek CSR
+    Mc = vc.fit_transform(df["gn"])   # seyrek CSR
+    M  = hstack([Mw, Mc], format="csr")   # birleşik, hâlâ seyrek
+    return (vw, vc), M
 
+def kullanici_vec(girdi_norm, vecs):
+    vw, vc = vecs
+    return hstack([vw.transform([girdi_norm]),
+                   vc.transform([girdi_norm])], format="csr")
 
-# ══════════════════════════════════════════════════════════
-#  BÖLÜM 3 ─ BİGRAM CÜMLE ÜRETİCİ  (Markov-light)
-# ══════════════════════════════════════════════════════════
-
-class CumleUretici:
-    """
-    Cevap cümlelerinden bigram (kelime çifti) tablosu öğrenir.
-    Verilen bir anahtar kelimeden başlayarak yeni cümle üretir.
-
-    Neden ML'yi aşmaz?
-      Bigram modeli istatistiksel dil modellemedir ve makine
-      öğrenmesinin bir alt dalıdır. GPT gibi büyük modeller
-      bunun derin sinir ağı versiyonudur. Küçük veriyle
-      hafıza dostu çalışır.
-    """
-
+# ─────────────────────────────────────────
+# BÖLÜM 3 — BİGRAM ÜRETİCİ
+# ─────────────────────────────────────────
+class Uretici:
     def __init__(self):
-        self.bigram: dict = defaultdict(list)   # {kelime: [sonraki, ...]}
-        self.baslar: list = []                  # cümle başı kelimeleri
+        self.bg: dict = defaultdict(list)
 
-    def egit(self, df: pd.DataFrame):
-        for cumle in df["cevap"]:
-            kelimeler = str(cumle).split()
-            if len(kelimeler) < 2:
-                continue
-            self.baslar.append(kelimeler[0])
-            for i in range(len(kelimeler) - 1):
-                self.bigram[kelimeler[i].lower()].append(kelimeler[i + 1])
-        print(f"[BİLGİ] Bigram tablosu: {len(self.bigram)} eşsiz kelime")
+    def egit(self, df):
+        for c in df["cevap"]:
+            ws = str(c).split()
+            for i in range(len(ws)-1):
+                self.bg[ws[i].lower()].append(ws[i+1])
 
-    def uret(self, anahtar: str, maks: int = 12) -> str | None:
+    def uret(self, anahtar, maks=12):
         ak = anahtar.lower()
-        baslangic = None
-
-        if ak in self.bigram:
-            baslangic = ak
-        else:
-            for k in self.bigram:
-                if ak in k or k in ak:
-                    baslangic = k
-                    break
-
-        if not baslangic:
+        bas = ak if ak in self.bg else next(
+              (k for k in self.bg if ak in k or k in ak), None)
+        if not bas:
             return None
+        c = [bas]; sim = bas
+        for _ in range(maks-1):
+            sec = self.bg.get(sim.lower(), [])
+            if not sec: break
+            sim = random.choice(sec); c.append(sim)
+            if sim[-1] in ".!?": break
+        m = " ".join(c)
+        return (m if m[-1] in ".!?" else m+".").capitalize()
 
-        cumle = [baslangic]
-        simdiki = baslangic
-        for _ in range(maks - 1):
-            secenekler = self.bigram.get(simdiki.lower(), [])
-            if not secenekler:
-                break
-            simdiki = random.choice(secenekler)
-            cumle.append(simdiki)
-            if simdiki[-1] in ".!?":
-                break
-
-        metin = " ".join(cumle)
-        if not metin[-1] in ".!?":
-            metin += "."
-        return metin.capitalize()
-
-
-# ══════════════════════════════════════════════════════════
-#  BÖLÜM 4 ─ CEVAP BULMA  (NumPy + Cosine)
-# ══════════════════════════════════════════════════════════
-
-_BELIRSIZLIK = [
-    "Bunu tam anlayamadım, farklı şekilde sorabilir misiniz?",
-    "Bu konuda yeterli bilgim yok ama öğrenmeye çalışıyorum!",
-    "Üzgünüm, sizi anlayamadım. Daha açık anlatır mısınız?",
-    "Henüz bu konuda eğitilmedim. Başka soru sorabilirsiniz.",
+# ─────────────────────────────────────────
+# BÖLÜM 4 — CEVAP BULMA
+# ─────────────────────────────────────────
+_BILMIYORUM = [
+    "Bunu anlayamadım, farklı sormayı dener misiniz?",
+    "Bu konuda eğitilmedim, başka şey sorabilirsiniz.",
+    "Tam anlayamadım, biraz daha açar mısınız?",
 ]
 
-def cevap_bul(girdi, df, vec, matris, uretici, esik=0.12, top_k=3, uretim_modu=False):
-    norm = _normalize(girdi)
-    v = vec.transform([norm])
-    skorlar = cosine_similarity(v, matris)[0]          # NumPy dizisi
+def cevap(girdi, df, vecs, M, uretici,
+          esik=0.15, top_k=3, uretim=False):
+    gn = _norm(girdi)
+    v  = kullanici_vec(gn, vecs)
+    sk = cosine_similarity(v, M)[0]               # ndarray (n,)
+    idx = np.argsort(sk)[::-1][:top_k]
+    skor = sk[idx[0]]
 
-    en_iyi = np.argsort(skorlar)[::-1][:top_k]        # büyükten küçüğe
-    en_iyi_skor = skorlar[en_iyi[0]]
+    if skor < esik:
+        return random.choice(_BILMIYORUM)
 
-    if en_iyi_skor < esik:
-        return random.choice(_BELIRSIZLIK)
+    ana = df.loc[idx[0], "cevap"]
 
-    ana_cevap = df.loc[en_iyi[0], "cevap"]
+    if uretim:
+        for k in [w for w in gn.split() if len(w) > 3]:
+            u = uretici.uret(k)
+            if u and u.lower() != ana.lower():
+                return f"{ana}\n  ↳ Üretilen: {u}"
 
-    # Üretim modu: bigram ile ek cümle
-    if uretim_modu:
-        kelimeler = [k for k in norm.split() if len(k) > 3]
-        for k in kelimeler:
-            uretilen = uretici.uret(k)
-            if uretilen and uretilen.lower() != ana_cevap.lower():
-                return f"{ana_cevap}\n  + Üretilen: {uretilen}"
+    if skor < 0.45 and len(idx) > 1 and sk[idx[1]] >= esik:
+        iki = df.loc[idx[1], "cevap"]
+        if iki != ana:
+            return f"{ana} — Ayrıca: {iki}"
 
-    # Düşük güven → 2. eşleşmeyi ekle
-    if en_iyi_skor < 0.5 and len(en_iyi) > 1:
-        ikinci_skor = skorlar[en_iyi[1]]
-        if ikinci_skor >= esik * 0.8:
-            ikinci = df.loc[en_iyi[1], "cevap"]
-            if ikinci != ana_cevap:
-                return f"{ana_cevap} Ayrıca: {ikinci}"
+    return ana
 
-    return ana_cevap
-
-
-# ══════════════════════════════════════════════════════════
-#  BÖLÜM 5 ─ ANA DÖNGÜ
-# ══════════════════════════════════════════════════════════
-
+# ─────────────────────────────────────────
+# BÖLÜM 5 — ANA DÖNGÜ
+# ─────────────────────────────────────────
 YARDIM = """
-  /uretim ac|kapat  → Bigram cümle üretimini aç/kapat
-  /uret <kelime>    → O kelimeden cümle üret
-  /istatistik       → Model bilgilerini göster
-  q veya /cikis     → Çıkış
+  /uretim ac|kapat   Bigram üretimini aç/kapat
+  /uret <kelime>     Kelimeden cümle üret
+  /info              Model istatistikleri
+  q / /cikis         Çıkış
 """
 
 def main():
     print("\n" + "="*52)
-    print("  Makine Ogrenmesi Tabanli Turkce ChatBot v2.0")
-    print("  Pandas | TF-IDF | NumPy | Bigram Uretici")
-    print("="*52 + "\n")
+    print("  ML Tabanlı Türkçe ChatBot  v3.0")
+    print("  Pandas(chunk) | word+char TF-IDF | Bigram")
+    print("="*52+"\n")
 
-    csv_yolu = sys.argv[1] if len(sys.argv) > 1 else "egitim_verisi_birlesik.csv"
+    yol = sys.argv[1] if len(sys.argv) > 1 else "egitim_verisi_temiz.csv"
 
-    df          = veri_yukle(csv_yolu)
-    vec, matris = vektorlestir(df)
-    uretici     = CumleUretici()
-    uretici.egit(df)
-
-    print(f"\n  Egitim satiri  : {len(df)}")
-    print(f"  TF-IDF ozellik : {matris.shape[1]}")
-    print(f"  Bigram kelime  : {len(uretici.bigram)}")
-    print("\nChatbot hazir! /yardim ile komutlari goruntuleyin.")
+    t0 = time.perf_counter()
+    df = veri_yukle(yol)
+    print(f"[✓] {len(df)} satır yüklendi")
+    vecs, M = vektorlestir(df)
+    print(f"[✓] Matris: {M.shape[0]}×{M.shape[1]}  "
+          f"doluluk %{M.nnz/(M.shape[0]*M.shape[1])*100:.2f}")
+    ur = Uretici(); ur.egit(df)
+    print(f"[✓] Bigram: {len(ur.bg)} kelime")
+    print(f"[✓] Hazır  ({time.perf_counter()-t0:.2f}s)\n")
+    print("Yardım için /yardim  |  Çıkış için q")
     print("-"*52)
 
-    uretim_modu = False
-
+    mod = False
     while True:
         try:
-            girdi = input("Sen : ").strip()
+            g = input("Sen : ").strip()
         except (KeyboardInterrupt, EOFError):
-            print("\nGorusuruz!")
-            break
+            print("\nGörüşmek üzere!"); break
 
-        if not girdi:
-            continue
-        if girdi.lower() in ("q", "/cikis", "exit"):
-            print("Bot : Gorusuruz!")
-            break
-        if girdi.lower() == "/yardim":
+        if not g: continue
+        gl = g.lower()
+
+        if gl in ("q","/cikis","exit"):
+            print("Bot : Görüşmek üzere!"); break
+        if gl == "/yardim":
             print(YARDIM); continue
-        if girdi.lower() == "/istatistik":
-            print(f"  Satir={len(df)}  Ozellik={matris.shape[1]}  Bigram={len(uretici.bigram)}")
-            continue
-        if "/uretim" in girdi.lower():
-            uretim_modu = "ac" in girdi.lower() or "aç" in girdi.lower()
-            print(f"Bot : Uretim modu {'ACIK' if uretim_modu else 'KAPALI'}")
-            continue
-        if girdi.lower().startswith("/uret "):
-            k = girdi[6:].strip()
-            u = uretici.uret(k)
-            print(f"Bot : {u or 'Bu kelimeden cümle uretemedi.'}")
-            print("-"*52); continue
+        if gl == "/info":
+            print(f"  Satır={len(df)}  Matris={M.shape}  "
+                  f"Bigram={len(ur.bg)}"); continue
+        if "/uretim" in gl:
+            mod = "ac" in gl or "aç" in gl
+            print(f"Bot : Üretim {'AÇIK ✅' if mod else 'KAPALI ❌'}"); continue
+        if gl.startswith("/uret "):
+            print(f"Bot : {ur.uret(g[6:].strip()) or 'Üretemedi.'}"); continue
 
-        cevap = cevap_bul(girdi, df, vec, matris, uretici, uretim_modu=uretim_modu)
-        print(f"Bot : {cevap}")
+        print(f"Bot : {cevap(g, df, vecs, M, ur, uretim=mod)}")
 
 if __name__ == "__main__":
     main()
