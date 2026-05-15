@@ -1,9 +1,10 @@
 """
-ML Tabanlı Türkçe ChatBot  v4.0
+ML Tabanlı Türkçe ChatBot  v5.0
 LinearSVC Etiketleme | Etiket-Havuz Sistemi | TF-IDF(word+char) | Token Sayacı
++ Zemberek Morfoloji: Kelime köklerine indirgeme ile benzerlik artışı
 """
 
-import sys, re, random, time
+import sys, re, random, time, logging
 import pandas as pd
 import numpy as np
 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -12,30 +13,107 @@ from sklearn.metrics.pairwise import cosine_similarity
 from scipy.sparse import hstack, vstack
 from collections import defaultdict
 
+# Zemberek loglarını sustur
+logging.getLogger("zemberek").setLevel(logging.WARNING)
+
 # ─────────────────────────────────────────
-# BÖLÜM 0 — TOKEN SAYACI
+# BÖLÜM 0 — ZEMBEREK ENTEGRASYONU
 # ─────────────────────────────────────────
-# Gerçek BPE/WordPiece tokenizer yokken basit ama anlamlı bir
-# yaklaşım: her kelimeyi ortalama 1.3 token (Türkçe eklemeli dil
-# olduğu için İngilizce'ye göre daha yüksek), noktalama ve özel
-# karakterleri ayrı birer token sayar.
-# Bu tahmin, GPT-4 / Claude tokenizer'larına yaklaşık uyar.
+# Zemberek: Türkçe için en kapsamlı açık kaynaklı NLP kütüphanesi.
+# Kelimeyi morfolojik olarak analiz edip köküne (lemma) indirgez.
+#
+# Örnek:
+#   gidiyorum  → gitmek
+#   arabaların → araba
+#   nasılsın   → nasıl
+#
+# Bu sayede "naber" ile "ne haber" aynı havuza düşmese de,
+# çekim eki taşıyan kelimeler (gittin/gitti/gidiyorum) artık
+# aynı kök token'ı paylaşır → kosinüs benzerliği belirgin artar.
+
+_morph = None  # Lazy init — ilk kullanımda yüklenir
+
+def _get_morph():
+    global _morph
+    if _morph is None:
+        try:
+            from zemberek import TurkishMorphology
+            print("[…] Zemberek morfoloji modeli yükleniyor…")
+            _morph = TurkishMorphology.create_with_defaults()
+            print("[✓] Zemberek hazır")
+        except ImportError:
+            print("[!] Zemberek bulunamadı. 'pip install zemberek-python' çalıştırın.")
+            print("[!] Zemberek olmadan devam ediliyor (kök indirgeme devre dışı).")
+            _morph = False  # Bir daha deneme yapma
+    return _morph
+
+
+def zemberek_kok(kelime: str) -> str:
+    """
+    Tek bir kelimeyi Zemberek ile köküne indirgez.
+    Analiz başarısız olursa kelimeyi olduğu gibi döndürür.
+    """
+    morph = _get_morph()
+    if not morph:
+        return kelime
+    try:
+        wa = morph.analyze(kelime)
+        ar = wa.analysis_results
+        if not ar:
+            return kelime
+        # Format: "[kök:Tür] ..."  → kök kısmını çek
+        m = re.match(r'\[(\w+)', str(ar[0]))
+        return m.group(1).lower() if m else kelime
+    except Exception:
+        return kelime
+
+
+# LRU benzeri önbellek: aynı kelimeyi tekrar tekrar analiz etme
+_kok_cache: dict[str, str] = {}
+
+def kok_cacheli(kelime: str) -> str:
+    if kelime not in _kok_cache:
+        _kok_cache[kelime] = zemberek_kok(kelime)
+    return _kok_cache[kelime]
+
+
+def metni_kokle(metin: str) -> str:
+    """
+    Bir metindeki tüm Türkçe kelimeleri köklerine indirger.
+    Sayılar ve noktalama işaretleri değiştirilmez.
+
+    Örnek:
+      "arabaların motoru bozuldu"  →  "araba motor bozmak"
+      "naber nasılsın"             →  "naber nasıl"
+    """
+    parcalar = re.findall(r'[a-zA-ZğüşıöçĞÜŞİÖÇ]+|[0-9]+|[^\s\w]', metin)
+    sonuc = []
+    for p in parcalar:
+        if re.fullmatch(r'[a-zA-ZğüşıöçĞÜŞİÖÇ]+', p):
+            sonuc.append(kok_cacheli(p))
+        else:
+            sonuc.append(p)
+    return ' '.join(sonuc)
+
+
+# ─────────────────────────────────────────
+# BÖLÜM 1 — TOKEN SAYACI
+# ─────────────────────────────────────────
+# Kök indirgemeden SONRA token sayımı yapılır.
+# Zemberek ile köklere ayrılmış metin daha kısa/yoğun olduğundan
+# token sayısı ham metne göre biraz düşük çıkabilir; bu doğaldur.
 
 def token_say(metin: str) -> int:
-    """Heuristik Türkçe token tahmini."""
-    # Noktalama / sayı ayrıştırması
+    """Heuristik Türkçe token tahmini (kök indirgeme sonrası)."""
     parcalar = re.findall(r"[a-zA-ZğüşıöçĞÜŞİÖÇ]+|[0-9]+|[^\s\w]", metin)
     sayim = 0
     for p in parcalar:
         if re.fullmatch(r"[a-zA-ZğüşıöçĞÜŞİÖÇ]+", p):
-            # Uzun Türkçe kelimeler birden fazla token alabilir
-            # Her 5 karakter ≈ 1 ekstra token (ek / kök ayrımı)
             sayim += 1 + max(0, (len(p) - 4) // 5)
         else:
             sayim += 1
     return max(1, sayim)
 
-# --- bak ---
 
 def token_ozeti(girdi: str, cevap: str) -> str:
     """Girdi + cevap için token istatistikleri döndürür."""
@@ -44,21 +122,31 @@ def token_ozeti(girdi: str, cevap: str) -> str:
     return (f"[Token → Girdi: ~{g_tok}  |  Cevap: ~{c_tok}  |  "
             f"Toplam: ~{g_tok + c_tok}]")
 
-# ─────────────────────────────────────────
-# BÖLÜM 1 — NORMALIZASYON
-# ─────────────────────────────────────────
-def _norm(t: str) -> str:
-    t = str(t).lower().strip()
-    t = re.sub(r"[^\w\s]", " ", t)
-    return re.sub(r"\s+", " ", t).strip()
 
 # ─────────────────────────────────────────
-# BÖLÜM 2 — ETİKET TANIMLAMA
+# BÖLÜM 2 — NORMALIZASYON
 # ─────────────────────────────────────────
-# Her etiket için çekirdek (seed) kelimeler tanımlanır.
-# LinearSVC bu tohumlardan vektörel genelleme yapar;
-# yani tohumda geçmeyen ama anlamca benzer girdileri de sınıflar.
-# Tohumlar eğitim verisindeki terimlerle örtüşmeli.
+def _norm(t: str) -> str:
+    """
+    Metin normalizasyonu:
+      1. Küçük harf + trim
+      2. Noktalama temizliği
+      3. Zemberek ile kök indirgeme  ← YENİ
+    """
+    t = str(t).lower().strip()
+    t = re.sub(r"[^\w\s]", " ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    t = metni_kokle(t)           # Kök indirgeme
+    return t
+
+
+# ─────────────────────────────────────────
+# BÖLÜM 3 — ETİKET TANIMLAMA
+# ─────────────────────────────────────────
+# Tohum kelimeler artık ham formlarıyla girilir;
+# _norm() içindeki Zemberek adımı onları da köklerine indirgeyecek.
+# Bu sayede "naber" ve "ne haber" tohum olarak eklenmese bile
+# benzer köklü girdiler doğru etikete çekilir.
 
 ETIKETLER = {
     "sohbet":      ["merhaba", "selam", "nasılsın", "iyi günler", "teşekkür",
@@ -98,8 +186,9 @@ ETIKETLER = {
                     "bitki", "hayvan", "enerji kaynağı", "sürdürülebilir"],
 }
 
+
 # ─────────────────────────────────────────
-# BÖLÜM 3 — VERİ YÜKLEME (chunk)
+# BÖLÜM 4 — VERİ YÜKLEME (chunk)
 # ─────────────────────────────────────────
 CHUNK_N = 256
 
@@ -115,15 +204,16 @@ def veri_yukle(yol: str) -> pd.DataFrame:
         chunk.columns = chunk.columns.str.strip().str.lower()
         if "girdi" not in chunk.columns or "cevap" not in chunk.columns:
             continue
-        chunk = (chunk.dropna(subset=["girdi","cevap"])
+        chunk = (chunk.dropna(subset=["girdi", "cevap"])
                       .assign(girdi=chunk["girdi"].str.strip(),
                               cevap=chunk["cevap"].str.strip()))
+        # _norm artık Zemberek'i de çağırır; ilk yüklemede yavaş olabilir
         chunk["gn"] = chunk["girdi"].apply(_norm)
         chunk = chunk[chunk["gn"].str.len() >= 2]
         chunk = chunk[chunk["cevap"].str.len() >= 5]
         chunk = chunk[~chunk["gn"].isin(gorduk)]
         gorduk.update(chunk["gn"].tolist())
-        parclar.append(chunk[["girdi","cevap","gn"]])
+        parclar.append(chunk[["girdi", "cevap", "gn"]])
 
     if not parclar:
         sys.exit("[HATA] CSV boş veya sütun yapısı hatalı.")
@@ -133,49 +223,38 @@ def veri_yukle(yol: str) -> pd.DataFrame:
     df.reset_index(drop=True, inplace=True)
     return df
 
-# ─────────────────────────────────────────
-# BÖLÜM 4 — LINEAR SVC ETİKETLEME
-# ─────────────────────────────────────────
-# Nasıl çalışır?
-#
-# 1. Her etiketin tohum cümlelerini "yapay eğitim seti" olarak kullan.
-# 2. Gerçek veriyi YALNIZCA tahmin için (predict) kullan.
-# 3. LinearSVC her girdi için vektör uzayında en yakın sınıf
-#    hiperplanını bulur; yani tohum kelimeler vektörü o yönde iter.
-#
-# LinearSVC seçim nedeni:
-#  • Yüksek boyutlu TF-IDF matrislerinde en iyi genelleme yapan model
-#  • LogisticRegression'dan daha hızlı eğitim, benzer doğruluk
-#  • Tohum-veri eğitiminde aşırı öğrenmeyi önler (margin maximization)
 
+# ─────────────────────────────────────────
+# BÖLÜM 5 — LINEAR SVC ETİKETLEME
+# ─────────────────────────────────────────
 def svc_etiketle(df: pd.DataFrame):
     """LinearSVC ile her satıra etiket ata."""
-    
-    # ── Tohum veri seti oluştur ──
+
+    # ── Tohum veri seti oluştur (köklenmiş) ──
     tohum_giris, tohum_etiket = [], []
     for etiket, kelimeler in ETIKETLER.items():
         for k in kelimeler:
-            # Her tohum kelimeyi birkaç varyasyonla genişlet
-            tohum_giris.extend([k, f"{k} nedir", f"{k} hakkında", 
-                                 f"{k} nasıl", f"{k} neden"])
-            tohum_etiket.extend([etiket] * 5)
+            varyasyonlar = [k, f"{k} nedir", f"{k} hakkında",
+                            f"{k} nasıl", f"{k} neden"]
+            for v in varyasyonlar:
+                tohum_giris.append(_norm(v))   # Zemberek köklendir
+                tohum_etiket.append(etiket)
 
     # ── Birleşik vektörleştirici (tohum + gerçek veri) ──
-    # Fit'i tüm veri üzerinde yaparız ki OOV (out-of-vocabulary)
-    # sorununu önleyelim; sadece tahmin aşamasında gerçek veriyi veririz.
-    tum_metin = [_norm(g) for g in tohum_giris] + df["gn"].tolist()
+    tum_metin = tohum_giris + df["gn"].tolist()
 
-    vw = TfidfVectorizer(analyzer="word", ngram_range=(1,2),
+    vw = TfidfVectorizer(analyzer="word", ngram_range=(1, 2),
                          sublinear_tf=True, max_features=3000)
-    vc = TfidfVectorizer(analyzer="char_wb", ngram_range=(2,3),
+    vc = TfidfVectorizer(analyzer="char_wb", ngram_range=(2, 3),
                          sublinear_tf=True, max_features=3000)
-    vw.fit(tum_metin); vc.fit(tum_metin)
+    vw.fit(tum_metin)
+    vc.fit(tum_metin)
 
     def _vec(metinler):
         return hstack([vw.transform(metinler),
                        vc.transform(metinler)], format="csr")
 
-    X_tohum = _vec([_norm(g) for g in tohum_giris])
+    X_tohum = _vec(tohum_giris)
     X_gercek = _vec(df["gn"].tolist())
 
     # ── LinearSVC eğit ──
@@ -185,15 +264,10 @@ def svc_etiketle(df: pd.DataFrame):
     df["etiket"] = svc.predict(X_gercek)
     return df, (vw, vc), svc
 
-# ─────────────────────────────────────────
-# BÖLÜM 5 — ETİKET BAZLI VEKTÖRLEŞTİRME
-# ─────────────────────────────────────────
-# Her etiket için ayrı TF-IDF matrisi tutulur.
-# Neden?
-#  • "fizik nedir" sorusu "sohbet" havuzuyla değil yalnızca
-#    "fizik" havuzuyla karşılaştırılır → gürültü düşer, doğruluk artar
-#  • Havuzlar küçük olduğundan bellek etkisi minimumdur
 
+# ─────────────────────────────────────────
+# BÖLÜM 6 — ETİKET BAZLI VEKTÖRLEŞTİRME
+# ─────────────────────────────────────────
 def etiket_matrisleri_olustur(df: pd.DataFrame, vecs):
     """Her etiket için satır indeksleri ve sparse matris döndür."""
     vw, vc = vecs
@@ -206,21 +280,24 @@ def etiket_matrisleri_olustur(df: pd.DataFrame, vecs):
         havuzlar[etiket] = {"df": alt.reset_index(drop=True), "M": M}
     return havuzlar
 
-def kullanici_vec(girdi_norm, vecs):
+
+def kullanici_vec(girdi_norm: str, vecs):
     vw, vc = vecs
     return hstack([vw.transform([girdi_norm]),
                    vc.transform([girdi_norm])], format="csr")
 
+
 # ─────────────────────────────────────────
-# BÖLÜM 6 — ETİKET TAHMİNİ (inference)
+# BÖLÜM 7 — ETİKET TAHMİNİ (inference)
 # ─────────────────────────────────────────
 def etiket_tahmin(girdi_norm: str, svc, vecs) -> str:
     """LinearSVC ile girdi etiketini tahmin et."""
     v = kullanici_vec(girdi_norm, vecs)
     return svc.predict(v)[0]
 
+
 # ─────────────────────────────────────────
-# BÖLÜM 7 — CEVAP BULMA
+# BÖLÜM 8 — CEVAP BULMA
 # ─────────────────────────────────────────
 _BILMIYORUM = [
     "Bunu anlayamadım, farklı sormayı dener misiniz?",
@@ -228,17 +305,18 @@ _BILMIYORUM = [
     "Tam anlayamadım, biraz daha açar mısınız?",
 ]
 
+
 def cevap_bul(girdi: str, havuzlar: dict, svc, vecs,
-              esik: float = 0.4, top_k: int = 3) -> tuple[str, str, float]:
+              esik: float = 0.4, top_k: int = 3) -> tuple:
     """
-    1. LinearSVC ile etiket tahmin et
-    2. Yalnızca o etiketin havuzunda kosinüs benzerliği ara
-    3. (etiket, cevap_metni, skor) döndür
+    1. Girdiyi Zemberek ile köklerine indirgez (_norm içinde)
+    2. LinearSVC ile etiket tahmin et
+    3. Yalnızca o etiketin havuzunda kosinüs benzerliği ara
+    4. (etiket, cevap_metni, skor) döndür
     """
-    gn = _norm(girdi)
+    gn = _norm(girdi)            # Zemberek köklendir + temizle
     etiket = etiket_tahmin(gn, svc, vecs)
 
-    # Etiket havuzda yoksa (uç durum) rastgele seç
     if etiket not in havuzlar:
         etiket = random.choice(list(havuzlar.keys()))
 
@@ -262,7 +340,6 @@ def cevap_bul(girdi: str, havuzlar: dict, svc, vecs,
 
     ana = havuz["df"].iloc[idx[0]]["cevap"]
 
-    # İkincil önerileri ekle (skor düşükse)
     if skor < 0.40 and len(idx) > 1 and sk[idx[1]] >= esik:
         iki = havuz["df"].iloc[idx[1]]["cevap"]
         if iki != ana:
@@ -270,40 +347,49 @@ def cevap_bul(girdi: str, havuzlar: dict, svc, vecs,
 
     return etiket, ana, float(skor)
 
-# Tüm havuzları birleştir (fallback için)
+
 def _tum_havuz(havuzlar: dict):
-    dfs = []
-    Ms  = []
+    dfs, Ms = [], []
     for et, h in havuzlar.items():
-        d = h["df"].copy(); d["etiket"] = et
-        dfs.append(d); Ms.append(h["M"])
+        d = h["df"].copy()
+        d["etiket"] = et
+        dfs.append(d)
+        Ms.append(h["M"])
     df_all = pd.concat(dfs, ignore_index=True)
     M_all  = vstack(Ms, format="csr")
     return df_all, M_all
 
+
 # ─────────────────────────────────────────
-# BÖLÜM 8 — YARDIM & ANA DÖNGÜ
+# BÖLÜM 9 — YARDIM & ANA DÖNGÜ
 # ─────────────────────────────────────────
 YARDIM = """
   /etiketler           Tüm etiketleri ve satır sayısını göster
   /token               Token sayacını aç/kapat
   /goster <etiket>     O etiketteki örnek girdileri listele
   /info                Model istatistikleri
+  /kok <kelime>        Kelimenin Zemberek kökünü göster
   q / /cikis           Çıkış
 """
 
+
 def main():
     print("\n" + "="*58)
-    print("  ML Tabanlı Türkçe ChatBot  v4.0")
-    print("  LinearSVC Etiket | Etiket-Havuz | word+char TF-IDF")
+    print("  ML Tabanlı Türkçe ChatBot  v5.0")
+    print("  LinearSVC | Etiket-Havuz | word+char TF-IDF")
+    print("  + Zemberek Morfoloji (kök indirgeme)")
     print("="*58+"\n")
 
     yol = sys.argv[1] if len(sys.argv) > 1 else "egitim_verisi_temiz.csv"
 
+    # Zemberek'i önceden yükle (lazy init tetikle)
+    _get_morph()
+
     t0 = time.perf_counter()
-    print("[…] Veri yükleniyor…")
+    print("[…] Veri yükleniyor ve köklendirilıyor (Zemberek)…")
+    print("    (İlk yükleme ekstra süre alabilir — kök önbelleği dolduruluyor)")
     df = veri_yukle(yol)
-    print(f"[✓] {len(df)} satır yüklendi")
+    print(f"[✓] {len(df)} satır yüklendi | Önbellekte {len(_kok_cache)} kök")
 
     print("[…] LinearSVC etiketleme başlıyor…")
     df, vecs, svc = svc_etiketle(df)
@@ -317,27 +403,31 @@ def main():
     print("Yardım için /yardim  |  Çıkış için q")
     print("-"*58)
 
-    token_mod = True   # Başlangıçta token gösterimi açık
+    token_mod = True
 
     while True:
         try:
             g = input("Sen : ").strip()
         except (KeyboardInterrupt, EOFError):
-            print("\nGörüşmek üzere!"); break
+            print("\nGörüşmek üzere!")
+            break
 
         if not g:
             continue
         gl = g.lower()
 
         if gl in ("q", "/cikis", "exit"):
-            print("Bot : Görüşmek üzere!"); break
+            print("Bot : Görüşmek üzere!")
+            break
 
         if gl in ("/yardim", "/help"):
-            print(YARDIM); continue
+            print(YARDIM)
+            continue
 
         if gl == "/info":
             print(f"  Satır={len(df)}  Etiket={len(havuzlar)}  "
-                  f"Kelime-vocab={len(vecs[0].vocabulary_)}")
+                  f"Kelime-vocab={len(vecs[0].vocabulary_)}  "
+                  f"Kök-önbellek={len(_kok_cache)}")
             continue
 
         if gl == "/etiketler":
@@ -351,6 +441,13 @@ def main():
         if gl == "/token":
             token_mod = not token_mod
             print(f"Bot : Token sayacı {'AÇIK ✅' if token_mod else 'KAPALI ❌'}")
+            continue
+
+        # YENİ: Zemberek kök sorgulama komutu
+        if gl.startswith("/kok "):
+            kelime = g[5:].strip()
+            kok = zemberek_kok(kelime.lower())
+            print(f"Bot : '{kelime}' → kök: '{kok}'")
             continue
 
         if gl.startswith("/goster "):
@@ -372,6 +469,7 @@ def main():
 
         if token_mod:
             print("  " + token_ozeti(g, yanit))
+
 
 if __name__ == "__main__":
     main()
