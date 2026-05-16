@@ -149,18 +149,90 @@ ETIKETLER = {
 }
 
 # ─────────────────────────────────────────────────────────────
-# BÖLÜM 2 — METİN NORMALİZASYONU
+# BÖLÜM 2 — STOP WORDS (veri setinden türetildi)
+# ─────────────────────────────────────────────────────────────
+#
+# Üç katmanlı liste:
+#
+# [A] TÜRKÇE GENEL BAĞLAÇLAR / EDATLAR / ZAMİRLER
+#     "ve", "ile", "da", "de" gibi hiçbir anlam taşımayan kelimeler.
+#     Bunlar TF-IDF'de yüksek frekans nedeniyle IDF ağırlığını düşürür,
+#     gürültü olarak dönem sınırını bulanıklaştırır.
+#
+# [B] OSMANLICADAKİ YÜKSEK-FREKANS EYLEM KÖKLERİ
+#     "etti", "oldu", "aldı", "geldi", "geçti" gibi neredeyse her
+#     cümlede geçen, hangi döneme ait olduğunu söylemeyen fiiller.
+#     Bunlar TF-IDF vektörünü tüm cümleler arasında düzleştirir;
+#     cosine benzerliği anlamsız yüksek çıkar.
+#
+# [C] MORFOLOJİK ARTIKLAR (ek halleri)
+#     Tokenizasyon sonrası kelimenin başından kopan harf/hece kalıntıları.
+#     Örn: "İstanbul'u" → "stanbul" + "u", "İngiltere" → "ngiltere".
+#     Bunlar vocab'ı kirletir ve char n-gram'ları yanıltır.
+#
+# NOT: "osmanlı", "sultan", "paşa", "gazi" gibi Osmanlı'ya özgü
+#      kelimeler stop words'e ALINMADI — dönem içi benzerlik için
+#      bu kelimeler hâlâ ayırt edici sinyal taşır.
+
+STOP_WORDS = {
+    # [A] Türkçe bağlaçlar / edatlar / zamirler
+    "ve", "ile", "da", "de", "te", "ya", "ki", "bu", "bir",
+    "o", "ama", "ancak", "fakat", "ne", "hem", "ya", "veya",
+    "için", "ise", "bile", "dahi", "kadar", "gibi", "göre",
+    "sonra", "önce", "ardından", "üzerine", "karşı", "olarak",
+    "her", "hiç", "en", "çok", "az", "daha", "çok", "bazı",
+    "tüm", "bütün", "son", "ilk", "yeni", "büyük", "küçük",
+    "önemli", "kalıcı", "gerçek", "tam", "kısa",
+
+    # [B] Yüksek frekanslı anlamsız eylem kökleri
+    "etti", "oldu", "olarak", "aldı", "geldi", "geçti",
+    "kurdu", "verdi", "çıktı", "başladı", "başlattı",
+    "yapıldı", "edildi", "katıldı", "sağladı",
+    "kaybetti", "yenildi", "kazandı", "bıraktı", "kaldı",
+    "alındı", "indirildi", "çekildi", "durduruldu",
+    "tanındı", "imzalandı", "ilan", "yaşandı", "sonuçlandı",
+    "uğratıldı", "pekiştirildi", "tamamlandı", "sürdü",
+    "kaldırıldı", "bastırıldı", "gönderildi",
+    # NOT: fethetti/fethederek/fethiyle BIRAKILDI — anlam taşır
+
+    # [C] Morfolojik artıklar (tokenizasyon kalıntıları)
+    "i", "ı", "u", "ü", "a", "e",        # tek harf ek kalıntıları
+    "nın", "nin", "nun", "nün",            # iyelik ekleri
+    "nda", "nde", "nde", "nda",            # bulunma hali kalıntıları
+    "nın", "daki", "deki", "taki", "teki", # sıfat fiil ekleri
+    "ya", "ye", "yı", "yi", "yu", "yü",   # yönelme/belirtme ekleri
+    "un", "ün", "in", "ın",               # ilgi hali ekleri
+    "stanbul", "ngiltere", "syanı",        # unicode/encoding kırıkları
+    "ii", "iii",                           # Osmanlı hükümdar sayıları tek başına
+    "hale", "getirdi",                     # "kalıcı hale getirdi" klişesi
+    "ele", "geçirdi",                      # "ele geçirdi" parçaları
+}
+
+# ─────────────────────────────────────────────────────────────
+# BÖLÜM 3 — METİN NORMALİZASYONU
 # ─────────────────────────────────────────────────────────────
 def _norm(t: str) -> str:
-    """Küçük harf, noktalama temizliği, boşluk normalizasyonu."""
+    """
+    Küçük harf → noktalama temizliği → stop words çıkar → boşluk normalize.
+    Stop words çıkarma yalnızca bağımsız token'larda yapılır;
+    'muharebesi' içindeki 'i' harfi etkilenmez.
+    """
     t = str(t).lower().strip()
     t = re.sub(r"[^\w\s]", " ", t)
-    t = re.sub(r"\s+", " ", t).strip()
-    return t
+    tokenlar = t.split()
+    # Stop words'e tam eşleşme — tek harf kalıntılar da kaldır
+    tokenlar = [tok for tok in tokenlar if tok not in STOP_WORDS and len(tok) > 1]
+    # Çok kısa kalan metni (< 2 token) olduğu gibi bırak; aşırı filtreleme önlenir
+    if len(tokenlar) < 2:
+        # Stop words uygulamadan sadece noktalama temizliği yap
+        ham = str(t).lower().strip()
+        ham = re.sub(r"[^\w\s]", " ", ham)
+        return re.sub(r"\s+", " ", ham).strip()
+    return " ".join(tokenlar).strip()
 
 
 # ─────────────────────────────────────────────────────────────
-# BÖLÜM 3 — VERİ YÜKLEME (tek sütunlu CSV)
+# BÖLÜM 4 — VERİ YÜKLEME (tek sütunlu CSV)
 # ─────────────────────────────────────────────────────────────
 CHUNK_N = 256
 
@@ -205,7 +277,7 @@ def veri_yukle(yol: str) -> pd.DataFrame:
 
 
 # ─────────────────────────────────────────────────────────────
-# BÖLÜM 4 — LINEAR SVC ETİKETLEME
+# BÖLÜM 5 — LINEAR SVC ETİKETLEME
 # ─────────────────────────────────────────────────────────────
 def svc_etiketle(df: pd.DataFrame):
     """
@@ -230,10 +302,12 @@ def svc_etiketle(df: pd.DataFrame):
     vw = TfidfVectorizer(
         analyzer="word", ngram_range=(1, 2),
         sublinear_tf=True, max_features=4000,
+        stop_words=list(STOP_WORDS),   # ← stop words buraya verildi
     )
     vc = TfidfVectorizer(
         analyzer="char_wb", ngram_range=(2, 4),
         sublinear_tf=True, max_features=4000,
+        # char n-gram'da stop words uygulanmaz; _norm zaten temizledi
     )
     vw.fit(tum_metin)
     vc.fit(tum_metin)
@@ -255,7 +329,7 @@ def svc_etiketle(df: pd.DataFrame):
 
 
 # ─────────────────────────────────────────────────────────────
-# BÖLÜM 5 — ETİKET BAZLI VEKTÖR HAVUZLARI
+# BÖLÜM 6 — ETİKET BAZLI VEKTÖR HAVUZLARI
 # ─────────────────────────────────────────────────────────────
 def havuz_olustur(df: pd.DataFrame, vecs):
     vw, vc = vecs
@@ -278,7 +352,7 @@ def kullanici_vec(girdi_norm: str, vecs):
 
 
 # ─────────────────────────────────────────────────────────────
-# BÖLÜM 6 — CEVAP BULMA
+# BÖLÜM 7 — CEVAP BULMA
 # ─────────────────────────────────────────────────────────────
 _BILMIYORUM = [
     "Bu konuda veri setimde bilgi bulamadım. Osmanlı tarihi hakkında başka bir şey sorabilirsiniz.",
@@ -286,7 +360,13 @@ _BILMIYORUM = [
     "Bu soruya yanıt verecek kayıt bulamadım. Dönem adı ya da olay adıyla tekrar sorabilirsiniz.",
 ]
 
-ESIK = 0.25  # Kısa sorgular ve az veri için toleranslı tutuldu
+ESIK_UZUN  = 0.30   # 4+ token → temiz sorgu, yüksek eşik
+ESIK_KISA  = 0.15   # 1-3 token → kısa sorgu, toleranslı eşik
+
+
+def _esik(gn: str) -> float:
+    """Sorgu uzunluğuna göre dinamik eşik döndür."""
+    return ESIK_UZUN if len(gn.split()) >= 4 else ESIK_KISA
 
 
 def _tum_havuz(havuzlar):
@@ -307,6 +387,7 @@ def cevap_bul(girdi: str, havuzlar: dict, svc, vecs, top_k: int = 3):
     4. (etiket, yanıt, skor) döndür.
     """
     gn = _norm(girdi)
+    esik = _esik(gn)
     v  = kullanici_vec(gn, vecs)
     etiket = svc.predict(v)[0]
 
@@ -318,7 +399,7 @@ def cevap_bul(girdi: str, havuzlar: dict, svc, vecs, top_k: int = 3):
     idx   = np.argsort(sk)[::-1][:top_k]
     skor  = float(sk[idx[0]])
 
-    if skor >= ESIK:
+    if skor >= esik:
         return etiket, havuz["df"].iloc[idx[0]]["cevap"], skor
 
     # Fallback: tüm havuzlarda ara
@@ -327,7 +408,7 @@ def cevap_bul(girdi: str, havuzlar: dict, svc, vecs, top_k: int = 3):
     idx2  = np.argsort(sk2)[::-1][:top_k]
     skor2 = float(sk2[idx2[0]])
 
-    if skor2 < ESIK:
+    if skor2 < esik:
         return "?", random.choice(_BILMIYORUM), 0.0
 
     satir = tum_df.iloc[idx2[0]]
@@ -335,7 +416,7 @@ def cevap_bul(girdi: str, havuzlar: dict, svc, vecs, top_k: int = 3):
 
 
 # ─────────────────────────────────────────────────────────────
-# BÖLÜM 7 — YARDIM & ANA DÖNGÜ
+# BÖLÜM 8 — YARDIM & ANA DÖNGÜ
 # ─────────────────────────────────────────────────────────────
 YARDIM = """
   /donemler          Tüm dönemleri ve satır sayılarını göster
