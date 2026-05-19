@@ -22,13 +22,13 @@ DONEM_ACIKLAMA = {
 # ─────────────────────────────────────────────────────────────
 STOP_WORDS = {
     "ve", "ile", "da", "de", "te", "ya", "ki", "bu", "bir",
-    "o", "ama", "ancak", "fakat", "ne", "hem", "ya", "veya",
+    "o", "ama", "ancak", "fakat", "hem", "ya", "veya",
     "için", "ise", "bile", "dahi", "kadar", "gibi", "göre",
     "sonra", "önce", "ardından", "üzerine", "karşı", "olarak",
     "her", "hiç", "en", "çok", "az", "daha", "çok", "bazı",
     "tüm", "bütün", "son", "ilk", "yeni", "büyük", "küçük",
     "önemli", "kalıcı", "gerçek", "tam", "kısa",
-    "etti", "oldu", "olarak", "aldı", "geldi", "geçti",
+    "etti", "olarak", "geldi", "geçti",
     "kurdu", "verdi", "çıktı", "başladı", "başlattı",
     "yapıldı", "edildi", "katıldı", "sağladı",
     "kaybetti", "yenildi", "kazandı", "bıraktı", "kaldı",
@@ -42,10 +42,7 @@ STOP_WORDS = {
     "nın", "daki", "deki", "taki", "teki",
     "ya", "ye", "yı", "yi", "yu", "yü",
     "un", "ün", "in", "ın",
-    "stanbul", "ngiltere", "syanı",
-    "ii", "iii",
-    "hale", "getirdi",
-    "ele", "geçirdi",
+
 }
 
 # ─────────────────────────────────────────────────────────────
@@ -141,7 +138,7 @@ def havuz_olustur(df: pd.DataFrame) -> dict:
 #   token_set_ratio skoru hesaplanır; eşik üstü en iyisi seçilir.
 #   Bulunamazsa tüm havuzlarda arama yapılır.
 # ─────────────────────────────────────────────────────────────
-FUZZY_ESIK = 55   # 0-100 arası; altında cevap üretilmez
+FUZZY_ESIK = 70   # 0-100 arası; altında cevap üretilmez
 
 _BILMIYORUM = [
     "Bu konuda veri setimde bilgi bulamadım. Osmanlı tarihi hakkında başka bir şey sorabilirsiniz.",
