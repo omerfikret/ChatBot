@@ -141,7 +141,7 @@ def havuz_olustur(df: pd.DataFrame) -> dict:
 #   token_set_ratio skoru hesaplanır; eşik üstü en iyisi seçilir.
 #   Bulunamazsa tüm havuzlarda arama yapılır.
 # ─────────────────────────────────────────────────────────────
-FUZZY_ESIK = 45   # 0-100 arası; altında cevap üretilmez
+FUZZY_ESIK = 55   # 0-100 arası; altında cevap üretilmez
 
 _BILMIYORUM = [
     "Bu konuda veri setimde bilgi bulamadım. Osmanlı tarihi hakkında başka bir şey sorabilirsiniz.",
